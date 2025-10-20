@@ -1,234 +1,306 @@
 /*
-  ESP32 Receiver - HTTP polling every 3s -> I2C 20x4 LCD
-  - Polls: http://192.168.1.50/api/devices
-  - Shows up to 4 active devices on a 20x4 I2C LCD
-  - Uses WiFiClient + HTTPClient + ArduinoJson + LiquidCrystal_I2C
+  ESP8266 HTTP Sensor (complete)
+  - Posts to Sender /api/report (includes MAC)
+  - Polls /api/config?name=... for updates
+  - Persist config (name, totalHeightCm, sensorToMaxCm) to EEPROM
+  - Uses new HTTPClient API: http.begin(WiFiClient, url)
+  ⚡ ESP8266 (Tank Sensor) — HC-SR04 Wiring
+HC-SR04 Pin	ESP8266 (NodeMCU) Pin	Notes
+VCC	5V	Sensor requires 5V power
+GND	GND	Common ground
+TRIG	D5 (GPIO14)	Trigger pin
+ECHO	D6 (GPIO12)	Echo pin → ⚠ Level shift to 3.3V using resistor divider (10k + 4.7k)
+ESP8266 VCC	3.3V	(ESP board itself runs on 3.3V)
 */
 
-#include <WiFi.h>
-#include <HTTPClient.h>
+#include <ESP8266WiFi.h>
+#include <ESP8266HTTPClient.h>
 #include <ArduinoJson.h>
-#include <LiquidCrystal_I2C.h>
-#include <Wire.h>
+#include <EEPROM.h>
 
-// ----- USER CONFIG -----
-const char* STA_SSID = "Airtel_7737476759";
-const char* STA_PASS = "air49169";
+/* ------------- USER CONFIG (edit per board) ------------- */
+char DEFAULT_NAME[] = "Tank-1";   // change per device: "Tank-1", "Tank-2", "Tank-3"
+const uint8_t TRIG_PIN = 14;      // D5 (GPIO14)
+const uint8_t ECHO_PIN = 12;      // D6 (GPIO12)
 
-const char* SENDER_HOST = "192.168.1.50"; // Sender STA IP
-const uint16_t SENDER_HTTP_PORT = 80;
-const unsigned long POLL_INTERVAL_MS = 3000UL; // 3 seconds
+const unsigned long REPORT_INTERVAL_MS = 2500;       // how often to POST sensor reading
+const unsigned long CONFIG_POLL_INTERVAL_MS = 15000; // how often to poll config
 
-// I2C LCD settings
-const uint8_t LCD_ADDR = 0x27; // change to 0x3F if needed
-const uint8_t LCD_COLS = 20;
-const uint8_t LCD_ROWS = 4;
-// ------------------------
+// Sender AP
+const char* SENDER_AP_SSID = "Sender-Direct";
+const char* SENDER_AP_PASS = "senderpass";
+const IPAddress SENDER_AP_IP(192,168,4,1);
 
-LiquidCrystal_I2C lcd(LCD_ADDR, LCD_COLS, LCD_ROWS);
+// Router fallback (optional)
+const bool TRY_ROUTER_FALLBACK = true;
+const char* ROUTER_SSID = "Airtel_7737476759";
+const char* ROUTER_PASS = "air49169";
+const IPAddress ROUTER_SENDER_IP(192,168,1,50); // Sender STA IP when on router
+/* ------------------------------------------------------- */
 
-unsigned long lastPoll = 0;
-bool wifiWasConnected = false;
+#define EEPROM_SIZE 128
+#define EEPROM_ADDR 0
+const uint32_t CONFIG_MAGIC = 0xA5A5A5A5;
 
-// a small struct for display info
-struct DisplayItem {
-  String label;   // name or MAC truncated
-  float percent;  // -1 means unknown
-};
+typedef struct {
+  char name[16];
+  float totalHeightCm;
+  float sensorToMaxCm;
+  uint32_t magic;
+} persisted_config_t;
 
-#define MAX_DISPLAY 4
+persisted_config_t cfg;
+unsigned long lastReport = 0;
+unsigned long lastConfigPoll = 0;
+uint32_t seqno = 0;
 
-// attempt WiFi connect (non-blocking-ish: tries for up to timeoutMillis)
-bool ensureWiFi(unsigned long timeoutMillis = 10000) {
-  if (WiFi.status() == WL_CONNECTED) return true;
-  Serial.printf("Connecting to WiFi '%s' ...\n", STA_SSID);
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(STA_SSID, STA_PASS);
-  unsigned long t0 = millis();
-  while (WiFi.status() != WL_CONNECTED && (millis() - t0) < timeoutMillis) {
-    delay(200);
-    Serial.print('.');
-  }
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.printf("\nWiFi connected, IP=%s\n", WiFi.localIP().toString().c_str());
+/* ---------------- EEPROM helpers ---------------- */
+void saveConfigToEEPROM() {
+  cfg.magic = CONFIG_MAGIC;
+  EEPROM.begin(EEPROM_SIZE);
+  uint8_t* p = (uint8_t*)&cfg;
+  for (size_t i=0;i<sizeof(cfg);i++) EEPROM.write(EEPROM_ADDR + i, p[i]);
+  EEPROM.commit();
+  EEPROM.end();
+  Serial.println("Config saved to EEPROM");
+}
+
+bool loadConfigFromEEPROM() {
+  EEPROM.begin(EEPROM_SIZE);
+  uint8_t* p = (uint8_t*)&cfg;
+  for (size_t i=0;i<sizeof(cfg);i++) p[i] = EEPROM.read(EEPROM_ADDR + i);
+  EEPROM.end();
+  if (cfg.magic == CONFIG_MAGIC) {
+    cfg.name[sizeof(cfg.name)-1] = 0;
     return true;
   }
-  Serial.println("\nWiFi connect failed");
   return false;
 }
 
-// Render up to 4 items on the LCD
-void renderLCD(DisplayItem items[], int count) {
-  lcd.clear();
-  if (count == 0) {
-    lcd.setCursor(0, 0);
-    lcd.print("No active devices");
-    return;
-  }
-  for (int r = 0; r < LCD_ROWS; ++r) {
-    lcd.setCursor(0, r);
-    if (r < count) {
-      String left = items[r].label;
-      if (left.length() > 14) left = left.substring(0, 14); // leave space for percent
-      // percent string
-      String pct;
-      if (items[r].percent < 0) pct = "--.-%";
-      else {
-        char buf[8];
-        snprintf(buf, sizeof(buf), "%5.1f%%", items[r].percent);
-        pct = String(buf);
-      }
-      // print left, pad, then pct at right
-      lcd.print(left);
-      int pad = LCD_COLS - left.length() - pct.length();
-      if (pad < 1) pad = 1;
-      for (int i=0;i<pad;i++) lcd.print(' ');
-      lcd.print(pct);
-    } else {
-      // empty row
-      for (int c=0;c<LCD_COLS;c++) lcd.print(' ');
-    }
-  }
+/* ---------------- HC-SR04 helpers ---------------- */
+float read_hcsr04_cm(unsigned long &duration_us) {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+  // 38ms timeout (~6.5m)
+  duration_us = pulseIn(ECHO_PIN, HIGH, 38000UL);
+  if (duration_us == 0) return -1.0f;
+  float cm = (duration_us / 2.0f) / 29.1f;
+  return cm;
 }
 
-// Poll the Sender /api/devices and build display list
-void httpPollAndDisplay() {
+float compute_percent_from_distance(float measured_cm, float total_height_cm, float sensor_to_max_cm) {
+  if (measured_cm < 0) return -1.0f;
+  float d_max_to_surface = sensor_to_max_cm + measured_cm;
+  float filled = total_height_cm - d_max_to_surface;
+  if (filled < 0) filled = 0;
+  if (filled > total_height_cm) filled = total_height_cm;
+  return (filled / total_height_cm) * 100.0f;
+}
+
+/* ---------------- Network helpers ---------------- */
+bool connectToSenderAP(unsigned long timeoutMs=5000) {
+  Serial.printf("Connecting to Sender AP '%s' ...\n", SENDER_AP_SSID);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(SENDER_AP_SSID, SENDER_AP_PASS);
+  unsigned long t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && (millis() - t0) < timeoutMs) {
+    Serial.print('.');
+    delay(200);
+  }
+  Serial.println();
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf("Connected to Sender AP. IP=%s  channel=%d\n", WiFi.localIP().toString().c_str(), WiFi.channel());
+    return true;
+  }
+  Serial.println("Failed to join Sender AP");
+  WiFi.disconnect(true);
+  return false;
+}
+
+bool connectToRouter(unsigned long timeoutMs=8000) {
+  Serial.printf("Trying router '%s' ...\n", ROUTER_SSID);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ROUTER_SSID, ROUTER_PASS);
+  unsigned long t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && (millis() - t0) < timeoutMs) {
+    Serial.print('.');
+    delay(250);
+  }
+  Serial.println();
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf("Connected to router. IP=%s channel=%d\n", WiFi.localIP().toString().c_str(), WiFi.channel());
+    return true;
+  }
+  Serial.println("Router connect failed");
+  WiFi.disconnect(true);
+  return false;
+}
+
+/* ---------------- HTTP report / config ---------------- */
+String getMacString() {
+  return WiFi.macAddress(); // "AA:BB:CC:DD:EE:FF"
+}
+
+bool postReport(float percent) {
   if (WiFi.status() != WL_CONNECTED) {
-    // try reconnect a bit quicker
-    ensureWiFi(5000);
-    if (WiFi.status() != WL_CONNECTED) {
-      // show disconnected
-      lcd.clear();
-      lcd.setCursor(0,0);
-      lcd.print("WiFi disconnected");
-      return;
-    }
+    Serial.println("No WiFi connection for report");
+    return false;
   }
 
-  String url = String("http://") + SENDER_HOST + "/api/devices";
+  String serverUrl;
+  IPAddress local = WiFi.localIP();
+  if (local[0] == 192 && local[1] == 168 && local[2] == 4) {
+    serverUrl = String("http://") + SENDER_AP_IP.toString() + "/api/report";
+  } else {
+    serverUrl = String("http://") + ROUTER_SENDER_IP.toString() + "/api/report";
+  }
+
   WiFiClient client;
   HTTPClient http;
-  http.begin(client, url);
-  int code = http.GET();
-  if (code != 200) {
-    Serial.printf("HTTP GET failed, code=%d\n", code);
+  http.begin(client, serverUrl);  // new API (ESP8266 core >=3.0)
+  http.addHeader("Content-Type", "application/json");
+
+  StaticJsonDocument<256> doc;
+  doc["name"] = cfg.name;
+  if (percent >= 0) doc["percent"] = percent;
+  doc["seq"] = seqno++;
+  doc["totalHeightCm"] = cfg.totalHeightCm;
+  doc["sensorToMaxCm"] = cfg.sensorToMaxCm;
+  doc["mac"] = getMacString();
+
+  String payload;
+  serializeJson(doc, payload);
+
+  Serial.printf("POST %s -> %s\n", payload.c_str(), serverUrl.c_str());
+  int httpCode = http.POST(payload);
+  if (httpCode > 0) {
+    String resp = http.getString();
+    Serial.printf("HTTP %d, resp: %s\n", httpCode, resp.c_str());
     http.end();
-    // optional: display message for short time
-    lcd.clear();
-    lcd.setCursor(0,0);
-    lcd.print("HTTP poll failed");
-    lcd.setCursor(0,1);
-    lcd.print("code: " + String(code));
-    return;
-  }
-
-  String body = http.getString();
-  http.end();
-
-  // parse JSON: expected array result like [ {mac:, ip:, rssi:, name:, percent:, age_seconds:, totalHeightCm:, sensorToMaxCm: ...}, ... ]
-  // The sender sent a JSON array at top-level. We'll parse safely.
-  const size_t CAP = 16 * 1024; // adjust if many devices
-  StaticJsonDocument<CAP> doc;
-  DeserializationError err = deserializeJson(doc, body);
-  if (err) {
-    Serial.printf("JSON parse failed: %s\n", err.c_str());
-    lcd.clear();
-    lcd.setCursor(0,0);
-    lcd.print("JSON parse error");
-    return;
-  }
-
-  // Build list of active devices: we'll consider device active if age_seconds exists and <= ACTIVE_THRESHOLD
-  const unsigned long ACTIVE_THRESHOLD_SEC = 15; // treat devices seen within last 15s as active
-  DisplayItem items[MAX_DISPLAY];
-  int found = 0;
-
-  // doc is an array (as used by Sender) or might be object — handle both
-  if (doc.is<JsonArray>()) {
-    JsonArray arr = doc.as<JsonArray>();
-    for (JsonObject o : arr) {
-      if (found >= MAX_DISPLAY) break;
-      // skip if age_seconds missing or too old
-      if (!o.containsKey("age_seconds") || o["age_seconds"].isNull()) continue;
-      long age = o["age_seconds"].as<long>();
-      if (age > (long)ACTIVE_THRESHOLD_SEC) continue;
-
-      // create label (prefer name, else mac)
-      const char* name = o["name"] | "";
-      const char* mac = o["mac"] | "";
-      String label;
-      if (name && strlen(name)) label = String(name);
-      else if (mac && strlen(mac)) label = String(mac);
-      else label = "device";
-
-      float pct = -1;
-      if (o.containsKey("percent") && !o["percent"].isNull()) {
-        pct = o["percent"].as<float>();
-      }
-      items[found].label = label;
-      items[found].percent = pct;
-      found++;
-    }
+    return (httpCode == 200 || httpCode == 201);
   } else {
-    // unexpected shape
-    Serial.println("api/devices returned non-array JSON");
-    lcd.clear();
-    lcd.setCursor(0,0);
-    lcd.print("Bad devices JSON");
-    return;
+    Serial.printf("HTTP POST failed, error: %s\n", http.errorToString(httpCode).c_str());
+    http.end();
+    return false;
   }
-
-  renderLCD(items, found);
-  Serial.printf("Displayed %d active devices\n", found);
 }
 
+bool pollConfigFromServer() {
+  if (WiFi.status() != WL_CONNECTED) return false;
+  String serverUrl;
+  IPAddress local = WiFi.localIP();
+  if (local[0] == 192 && local[1] == 168 && local[2] == 4) {
+    serverUrl = String("http://") + SENDER_AP_IP.toString() + "/api/config?name=" + String(cfg.name);
+  } else {
+    serverUrl = String("http://") + ROUTER_SENDER_IP.toString() + "/api/config?name=" + String(cfg.name);
+  }
+
+  WiFiClient client;
+  HTTPClient http;
+  http.begin(client, serverUrl);
+  int httpCode = http.GET();
+  if (httpCode == 200) {
+    String body = http.getString();
+    http.end();
+    StaticJsonDocument<256> doc;
+    auto err = deserializeJson(doc, body);
+    if (!err) {
+      const char* name = doc["name"] | "";
+      float th = doc["totalHeightCm"] | cfg.totalHeightCm;
+      float s2m = doc["sensorToMaxCm"] | cfg.sensorToMaxCm;
+      bool changed = false;
+      if (strlen(name) && strcmp(name, cfg.name) != 0) {
+        strncpy(cfg.name, name, sizeof(cfg.name)-1);
+        cfg.name[sizeof(cfg.name)-1] = 0;
+        changed = true;
+      }
+      if (fabs(cfg.totalHeightCm - th) > 0.001) { cfg.totalHeightCm = th; changed = true; }
+      if (fabs(cfg.sensorToMaxCm - s2m) > 0.001) { cfg.sensorToMaxCm = s2m; changed = true; }
+      if (changed) {
+        saveConfigToEEPROM();
+        Serial.println("Config updated from server");
+      } else Serial.println("Config poll: no changes");
+      return true;
+    } else {
+      Serial.printf("Config JSON parse err: %s\n", err.c_str());
+      return false;
+    }
+  } else {
+    if (httpCode > 0) Serial.printf("Config poll HTTP %d\n", httpCode);
+    else Serial.printf("Config poll failed: %s\n", http.errorToString(httpCode).c_str());
+    http.end();
+    return false;
+  }
+}
+
+/* ---------------- setup / loop ---------------- */
 void setup() {
   Serial.begin(115200);
   delay(50);
-  Serial.println("\nESP32 Receiver (HTTP polling) starting...");
+  Serial.println("\nESP8266 HTTP Sensor starting...");
 
-  // initialize I2C LCD
-  Wire.begin(); // default SDA=21, SCL=22 on most ESP32 boards
-  lcd.init();
-  lcd.backlight();
-  lcd.clear();
-  lcd.setCursor(0,0);
-  lcd.print("Receiver starting...");
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
 
-  // attempt WiFi connect (non-blocking)
-  ensureWiFi(10000);
-  if (WiFi.status() == WL_CONNECTED) {
-    lcd.clear();
-    lcd.setCursor(0,0);
-    lcd.print("WiFi connected");
-    delay(700);
+  if (!loadConfigFromEEPROM()) {
+    memset(&cfg, 0, sizeof(cfg));
+    strncpy(cfg.name, DEFAULT_NAME, sizeof(cfg.name)-1);
+    cfg.totalHeightCm = 80.0f;
+    cfg.sensorToMaxCm = 2.0f;
+    cfg.magic = CONFIG_MAGIC;
+    saveConfigToEEPROM();
+    Serial.println("Wrote default config to EEPROM");
   } else {
-    lcd.clear();
-    lcd.setCursor(0,0);
-    lcd.print("WiFi not connected");
-    delay(700);
+    Serial.printf("Loaded config: name='%s' H=%.1f S2M=%.1f\n", cfg.name, cfg.totalHeightCm, cfg.sensorToMaxCm);
   }
 
-  lastPoll = millis() - POLL_INTERVAL_MS; // poll immediately on first loop
-}
-
-void loop() {
-  unsigned long now = millis();
-
-  // Reconnect WiFi automatically when needed (quick check)
-  if (WiFi.status() != WL_CONNECTED) {
-    static unsigned long lastTry = 0;
-    if (now - lastTry > 5000) { // try every 5s
-      lastTry = now;
-      ensureWiFi(5000);
+  // Try connect to Sender AP first
+  bool joinedAP = connectToSenderAP(5000);
+  if (!joinedAP && TRY_ROUTER_FALLBACK) {
+    bool joinedRouter = connectToRouter(8000);
+    if (!joinedRouter) {
+      Serial.println("No WiFi connection available. Will retry in loop.");
     }
   }
 
-  if (now - lastPoll >= POLL_INTERVAL_MS) {
-    lastPoll = now;
-    httpPollAndDisplay();
+  lastReport = millis();
+  lastConfigPoll = millis();
+}
+
+void loop() {
+  // ensure wifi; try to connect if not connected
+  if (WiFi.status() != WL_CONNECTED) {
+    // try Sender AP briefly
+    if (!connectToSenderAP(3000)) {
+      if (TRY_ROUTER_FALLBACK) connectToRouter(5000);
+    }
   }
 
-  // do short delays to let WiFi/other tasks run
-  delay(10);
+  unsigned long now = millis();
+
+  if (now - lastReport >= REPORT_INTERVAL_MS) {
+    lastReport = now;
+    unsigned long dur;
+    float dcm = read_hcsr04_cm(dur);
+    float pct = -1;
+    if (dcm < 0) {
+      Serial.println("HC-SR04 timeout");
+    } else {
+      pct = compute_percent_from_distance(dcm, cfg.totalHeightCm, cfg.sensorToMaxCm);
+      Serial.printf("Measured %.2f cm => %.1f%% (raw %lu us)\n", dcm, pct, dur);
+    }
+    bool ok = postReport(pct);
+    if (!ok) Serial.println("Report failed");
+  }
+
+  if (now - lastConfigPoll >= CONFIG_POLL_INTERVAL_MS) {
+    lastConfigPoll = now;
+    bool ok = pollConfigFromServer();
+    if (!ok) Serial.println("Config poll failed or no change");
+  }
+
+  yield(); // allow background tasks
 }

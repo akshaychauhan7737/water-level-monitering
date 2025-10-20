@@ -1,249 +1,191 @@
 /*
-  ESP32 Receiver (WebSocket + HTTP fallback) -> I2C 20x4 LCD
-  - Connects to router (STA) using provided credentials
-  - Connects WebSocket to Sender (ws://192.168.1.50:81/)
-  - Displays up to 4 active devices on a 20x4 I2C LCD
-  - If WS is down, polls http://192.168.1.50/api/devices every POLL_INTERVAL_MS
+  Receiver_ESP32.ino
+  - Connects to router STA using provided credentials
+  - Polls Sender at http://192.168.1.50/api/devices every 3 seconds
+  - Displays up to 4 active devices on I2C 20x4 LCD (LiquidCrystal_I2C)
+
+  🧠 ESP32 Receiver Wiring (I²C LCD 20×4)
+LCD Pin	Connect to ESP32 Pin	Notes
+VCC	5V or 3.3V	Most I²C LCDs work with 5V; check your module (both logic 3.3V-safe)
+GND	GND	Common ground with ESP32
+SDA	GPIO 21 (D21)	I²C data line
+SCL	GPIO 22 (D22)	I²C clock line
 */
 
 #include <WiFi.h>
-#include <WebSocketsClient.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <LiquidCrystal_I2C.h>
+#include <Wire.h>
 
-// ---------------- USER CONFIG ----------------
+// ----- USER CONFIG -----
 const char* STA_SSID = "Airtel_7737476759";
 const char* STA_PASS = "air49169";
 
-// Sender address (STA IP from your Sender sketch)
-const char* SENDER_HOST = "192.168.1.50";
-const uint16_t SENDER_WS_PORT = 81;
-const uint16_t SENDER_HTTP_PORT = 80;
+const char* SENDER_HOST = "192.168.1.50"; // Sender STA IP
+const unsigned long POLL_INTERVAL_MS = 3000UL; // 3 seconds
 
-const unsigned long POLL_INTERVAL_MS = 5000UL;  // fallback HTTP poll when WS disconnected
-const unsigned long WS_RECONNECT_MS = 3000UL;   // try WS reconnect every N ms
-
-// I2C LCD config - change address if your module is different (0x27 or 0x3F)
-const uint8_t LCD_ADDR = 0x27;
+const uint8_t LCD_ADDR = 0x27; // adjust to your module (0x3F possible)
 const uint8_t LCD_COLS = 20;
 const uint8_t LCD_ROWS = 4;
-// ---------------------------------------------
+// ------------------------
 
-WebSocketsClient webSocket;
 LiquidCrystal_I2C lcd(LCD_ADDR, LCD_COLS, LCD_ROWS);
 
-// store last devices message JSON for display
-StaticJsonDocument<8192> lastDevicesDoc; // may be large if many devices; adjust if memory issues
-bool haveDevices = false;
 unsigned long lastPoll = 0;
-unsigned long lastWsAttempt = 0;
 
-// helper to ensure WiFi connected
-void ensureWiFi() {
-  if (WiFi.status() == WL_CONNECTED) return;
+struct DisplayItem {
+  String label;
+  float percent;
+};
+
+#define MAX_DISPLAY 4
+
+bool ensureWiFi(unsigned long timeoutMillis = 10000) {
+  if (WiFi.status() == WL_CONNECTED) return true;
   Serial.printf("Connecting to WiFi '%s' ...\n", STA_SSID);
+  WiFi.mode(WIFI_STA);
   WiFi.begin(STA_SSID, STA_PASS);
-  unsigned long start = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - start < 10000) {
+  unsigned long t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && (millis() - t0) < timeoutMillis) {
+    delay(200);
     Serial.print('.');
-    delay(300);
   }
-  Serial.println();
   if (WiFi.status() == WL_CONNECTED) {
-    Serial.printf("WiFi connected. IP=%s\n", WiFi.localIP().toString().c_str());
-  } else {
-    Serial.println("WiFi connect failed. Will retry in loop.");
+    Serial.printf("\nWiFi connected, IP=%s\n", WiFi.localIP().toString().c_str());
+    return true;
   }
+  Serial.println("\nWiFi connect failed");
+  return false;
 }
 
-// Render up to 4 devices on the 20x4 display
-void renderDevicesOnLCD() {
+void renderLCD(DisplayItem items[], int count) {
   lcd.clear();
-  if (!haveDevices) {
-    lcd.setCursor(0,0);
-    lcd.print("No devices (yet)");
+  if (count == 0) {
+    lcd.setCursor(0, 0);
+    lcd.print("No active devices");
     return;
   }
-
-  // Expect JSON: {"type":"devices","devices":[ {mac:, name:, percent:, ...}, ... ] }
-  if (!lastDevicesDoc.containsKey("devices")) {
-    lcd.setCursor(0,0);
-    lcd.print("No devices array");
-    return;
-  }
-
-  JsonArray arr = lastDevicesDoc["devices"].as<JsonArray>();
-  int row = 0;
-  for (JsonObject dev : arr) {
-    if (row >= LCD_ROWS) break;
-    const char* name = dev["name"] | "";
-    const char* mac = dev["mac"] | "";
-    // label: prefer name, else mac (truncate to fit)
-    String left;
-    if (name && strlen(name)) left = String(name);
-    else if (mac && strlen(mac)) left = String(mac);
-    else left = "device";
-
-    // percent display
-    String pct = "--";
-    if (dev.containsKey("percent") && !dev["percent"].isNull()) {
-      float p = dev["percent"].as<float>();
-      char buf[8];
-      snprintf(buf, sizeof(buf), "%5.1f%%", p);
-      pct = String(buf);
-    }
-
-    // ensure left is not longer than 14 chars to leave space for percent at right
-    if (left.length() > 14) left = left.substring(0, 14);
-
-    // write to lcd: left at col0, percent right aligned at col 20 - len
-    lcd.setCursor(0, row);
-    lcd.print(left);
-    // clear rest of line before printing percent
-    int curLen = left.length();
-    for (int c = curLen; c < LCD_COLS - 6; ++c) lcd.print(' ');
-    // place percent at column 20 - 6 (fits e.g. "100.0%")
-    int pctCol = LCD_COLS - 6;
-    if (pctCol < (int)curLen + 1) pctCol = curLen + 1;
-    lcd.setCursor(pctCol, row);
-    lcd.print(pct);
-    row++;
-  }
-
-  // if fewer than rows, fill remaining lines with empty
-  for (int r = lastDevicesDoc["devices"].size(); r < LCD_ROWS; ++r) {
-    if (r >= LCD_ROWS) break;
+  for (int r = 0; r < LCD_ROWS; ++r) {
     lcd.setCursor(0, r);
-    lcd.print("                    "); // 20 spaces
+    if (r < count) {
+      String left = items[r].label;
+      if (left.length() > 14) left = left.substring(0, 14);
+      String pct;
+      if (items[r].percent < 0) pct = "--.-%";
+      else {
+        char buf[8];
+        snprintf(buf, sizeof(buf), "%5.1f%%", items[r].percent);
+        pct = String(buf);
+      }
+      lcd.print(left);
+      int pad = LCD_COLS - left.length() - pct.length();
+      if (pad < 1) pad = 1;
+      for (int i=0;i<pad;i++) lcd.print(' ');
+      lcd.print(pct);
+    } else {
+      for (int c=0;c<LCD_COLS;c++) lcd.print(' ');
+    }
   }
 }
 
-// parse incoming WebSocket text message
-void handleWsMessage(const char* payload, size_t length) {
-  Serial.printf("WS RX: %.*s\n", (int)length, payload);
-  // parse JSON (reuse lastDevicesDoc)
-  DeserializationError err = deserializeJson(lastDevicesDoc, payload, length);
-  if (err) {
-    Serial.printf("JSON parse error: %s\n", err.c_str());
-    return;
+void httpPollAndDisplay() {
+  if (WiFi.status() != WL_CONNECTED) {
+    ensureWiFi(5000);
+    if (WiFi.status() != WL_CONNECTED) {
+      lcd.clear(); lcd.setCursor(0,0); lcd.print("WiFi disconnected");
+      return;
+    }
   }
-  const char* type = lastDevicesDoc["type"] | "";
-  if (strcmp(type, "devices") == 0) {
-    haveDevices = true;
-    renderDevicesOnLCD();
-  } else if (strcmp(type, "config") == 0) {
-    // config update received — optionally refresh display by requesting devices via HTTP
-    // For now we'll call render if we also included a devices field or rely on subsequent devices broadcast
-    Serial.println("Config update received");
-  } else {
-    // unknown message type - ignore
-    Serial.println("Unknown WS message type");
-  }
-}
 
-// WebSocket event callback
-void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
-  switch (type) {
-    case WStype_CONNECTED:
-      Serial.println("WS connected to sender");
-      // optionally request immediate snapshot — but sender broadcasts on connect
-      break;
-    case WStype_DISCONNECTED:
-      Serial.println("WS disconnected");
-      break;
-    case WStype_TEXT:
-      handleWsMessage((const char*)payload, length);
-      break;
-    case WStype_ERROR:
-      Serial.println("WS error");
-      break;
-    default:
-      break;
-  }
-}
-
-// attempt to connect WS to sender
-void ensureWebSocket() {
-  if (webSocket.isConnected()) return;
-  if (WiFi.status() != WL_CONNECTED) return;
-  unsigned long now = millis();
-  if (now - lastWsAttempt < WS_RECONNECT_MS) return;
-  lastWsAttempt = now;
-  Serial.printf("WS connecting to %s:%u ...\n", SENDER_HOST, SENDER_WS_PORT);
-  webSocket.begin(SENDER_HOST, SENDER_WS_PORT, "/");
-  webSocket.onEvent(webSocketEvent);
-  webSocket.setReconnectInterval(0); // we handle reconnect ourselves
-}
-
-// fallback HTTP poll
-void httpPollDevices() {
-  if (WiFi.status() != WL_CONNECTED) return;
   String url = String("http://") + SENDER_HOST + "/api/devices";
   WiFiClient client;
   HTTPClient http;
   http.begin(client, url);
   int code = http.GET();
-  if (code == 200) {
-    String body = http.getString();
-    Serial.println("HTTP poll got devices");
-    DeserializationError err = deserializeJson(lastDevicesDoc, body);
-    if (!err) {
-      haveDevices = true;
-      renderDevicesOnLCD();
-    } else {
-      Serial.printf("HTTP parse error: %s\n", err.c_str());
+  if (code != 200) {
+    Serial.printf("HTTP GET failed, code=%d\n", code);
+    http.end();
+    lcd.clear(); lcd.setCursor(0,0); lcd.print("HTTP poll failed"); lcd.setCursor(0,1); lcd.print("code: " + String(code));
+    return;
+  }
+  String body = http.getString();
+  http.end();
+
+  const size_t CAP = 16 * 1024;
+  StaticJsonDocument<CAP> doc;
+  DeserializationError err = deserializeJson(doc, body);
+  if (err) {
+    Serial.printf("JSON parse failed: %s\n", err.c_str());
+    lcd.clear(); lcd.setCursor(0,0); lcd.print("JSON parse error");
+    return;
+  }
+
+  const unsigned long ACTIVE_THRESHOLD_SEC = 15;
+  DisplayItem items[MAX_DISPLAY];
+  int found = 0;
+
+  if (doc.is<JsonArray>()) {
+    JsonArray arr = doc.as<JsonArray>();
+    for (JsonObject o : arr) {
+      if (found >= MAX_DISPLAY) break;
+      if (!o.containsKey("age_seconds") || o["age_seconds"].isNull()) continue;
+      long age = o["age_seconds"].as<long>();
+      if (age > (long)ACTIVE_THRESHOLD_SEC) continue;
+      const char* name = o["name"] | "";
+      const char* mac = o["mac"] | "";
+      String label;
+      if (name && strlen(name)) label = String(name);
+      else if (mac && strlen(mac)) label = String(mac);
+      else label = "device";
+      float pct = -1;
+      if (o.containsKey("percent") && !o["percent"].isNull()) pct = o["percent"].as<float>();
+      items[found].label = label;
+      items[found].percent = pct;
+      found++;
     }
   } else {
-    Serial.printf("HTTP poll failed code=%d\n", code);
+    Serial.println("api/devices returned non-array JSON");
+    lcd.clear(); lcd.setCursor(0,0); lcd.print("Bad devices JSON");
+    return;
   }
-  http.end();
+
+  renderLCD(items, found);
+  Serial.printf("Displayed %d active devices\n", found);
 }
 
 void setup() {
   Serial.begin(115200);
-  delay(100);
+  delay(50);
   Serial.println("\nESP32 Receiver starting...");
 
-  // init LCD
+  Wire.begin(); // default SDA=21, SCL=22
   lcd.init();
   lcd.backlight();
   lcd.clear();
   lcd.setCursor(0,0);
   lcd.print("Receiver starting...");
 
-  // connect WiFi
-  ensureWiFi();
-
-  // setup websocket (not yet connected until ensureWebSocket called)
-  webSocket.begin(SENDER_HOST, SENDER_WS_PORT, "/");
-  webSocket.onEvent(webSocketEvent);
-  webSocket.setReconnectInterval(0);
-
-  lastPoll = millis();
-  lastWsAttempt = 0;
+  ensureWiFi(10000);
+  if (WiFi.status() == WL_CONNECTED) {
+    lcd.clear(); lcd.setCursor(0,0); lcd.print("WiFi connected");
+    delay(700);
+  } else {
+    lcd.clear(); lcd.setCursor(0,0); lcd.print("WiFi not connected");
+    delay(700);
+  }
+  lastPoll = millis() - POLL_INTERVAL_MS;
 }
 
 void loop() {
-  // ensure WiFi
+  unsigned long now = millis();
   if (WiFi.status() != WL_CONNECTED) {
-    ensureWiFi();
+    static unsigned long lastTry = 0;
+    if (now - lastTry > 5000) { lastTry = now; ensureWiFi(5000); }
   }
-
-  // ensure WS
-  ensureWebSocket();
-
-  // process websocket (if connected)
-  webSocket.loop();
-
-  // if websocket not connected, fallback to HTTP poll every POLL_INTERVAL_MS
-  if (!webSocket.isConnected()) {
-    unsigned long now = millis();
-    if (now - lastPoll >= POLL_INTERVAL_MS) {
-      lastPoll = now;
-      httpPollDevices();
-    }
+  if (now - lastPoll >= POLL_INTERVAL_MS) {
+    lastPoll = now;
+    httpPollAndDisplay();
   }
-
   delay(10);
 }
