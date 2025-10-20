@@ -1,0 +1,300 @@
+/*
+  ESP32 3-Tank Sender — Common Trigger + Long Delay + Multi-beep Trigger
+  ---------------------------------------------------------------------
+  - COMMON_TRIG_PIN drives all sensors' TRIG inputs (wired in parallel)
+  - Each sensor has its own ECHO pin
+  - Reads sequentially (one-by-one) with larger delay between tanks
+  - Emits multiple longer "beeps" on the trigger for each ping to push more energy
+  - Median-of-pings + preconditioning + EMA smoothing
+  - Sends StructMessage { TankData tanks[3] } via UDP to receiver
+  - Sends on change OR periodic global keepalive
+*/
+
+#include <WiFi.h>
+#include <WiFiUdp.h>
+
+// ===== WiFi / UDP CONFIG =====
+const char* WIFI_SSID = "Airtel_7737476759";
+const char* WIFI_PASS = "air49169";
+IPAddress RECV_IP(192,168,1,100);
+const uint16_t RECV_PORT = 4210;
+WiFiUDP Udp;
+
+// ===== SYSTEM TUNABLES =====
+const int NUM_TANKS = 3;
+const unsigned long SAMPLE_INTERVAL_MS = 2000UL;   // time between full read cycles
+const int PINGS_PER_BATCH = 5;                     // number of pings per sensor (median)
+const unsigned long SENSOR_DELAY_MS = 800UL;       // DELAY BETWEEN SENSORS (increased)
+const unsigned long DIGITAL_ECHO_TIMEOUT_US = 40000UL;
+const unsigned long MIN_TRIGGER_GAP_MS = 150UL;    // gap between trigger events
+const float SMOOTH_ALPHA = 0.30f;
+const float SEND_MIN_DELTA_PCT = 0.6f;
+const unsigned long FORCE_SEND_MS = 30000UL;
+const unsigned long GLOBAL_KEEPALIVE_MS = 30000UL; // send even if no change
+
+// ===== COMMON TRIGGER + BEEP SETTINGS =====
+const uint8_t COMMON_TRIG_PIN = 25;   // drives all TRIGs in parallel
+const int BEEP_COUNT = 3;             // how many trigger "beeps" to emit per ping
+const unsigned int BEEP_PULSE_US = 40; // width of each beep in microseconds (40us)
+const unsigned long BEEP_GAP_MS = 60; // gap between beeps in milliseconds
+
+// ===== Per-tank config (name, totalHeightCm, waterFullDistanceCm, echoPin) =====
+struct TankConfig {
+  char name[16];
+  float totalHeightCm;
+  float waterFullDistanceCm;
+  uint8_t echoPin;
+};
+
+TankConfig tanksConfig[NUM_TANKS] = {
+  { "Kitchen",  90.0f, 21.0f, 26 },
+  { "Ground 1", 82.0f, 21.0f, 33 },
+  { "Ground 2", 90.0f, 21.0f, 32 }
+};
+
+// ===== Message format (must match receiver) =====
+struct TankData { char name[16]; float levelPercent; };
+struct StructMessage { TankData tanks[NUM_TANKS]; };
+
+// ===== Runtime state per slot =====
+struct SlotState {
+  float level;            // smoothed percent (0..100), -1 = unknown
+  float lastSentValue;    // last numeric value we sent (-1 = none)
+  unsigned long lastAcceptedMs;
+  unsigned long lastSentMs;
+};
+SlotState slotState[NUM_TANKS];
+
+unsigned long lastCycleMs = 0;
+unsigned long lastGlobalSendMs = 0;
+
+// ===== Low-level helpers =====
+unsigned long readPulseMicrosWithTimeout(int pin, unsigned long timeout_us) {
+  unsigned long start = micros();
+  while (digitalRead(pin) == LOW) {
+    if ((micros() - start) > timeout_us) return 0;
+  }
+  unsigned long t0 = micros();
+  while (digitalRead(pin) == HIGH) {
+    if ((micros() - t0) > timeout_us) return 0;
+  }
+  return micros() - t0;
+}
+
+// Precondition common TRIG line (helps long cable edge fidelity)
+void preconditionCommonTrigger() {
+  digitalWrite(COMMON_TRIG_PIN, LOW);
+  delayMicroseconds(50);
+  for (int i = 0; i < 3; ++i) {
+    digitalWrite(COMMON_TRIG_PIN, HIGH);
+    delayMicroseconds(60);
+    digitalWrite(COMMON_TRIG_PIN, LOW);
+    delayMicroseconds(60);
+  }
+  delayMicroseconds(200);
+}
+
+// Emit multiple longer beeps on the common trigger, then measure echo on given echoPin
+float pingUsingCommonTrigger(uint8_t echoPin) {
+  static unsigned long lastTrig = 0;
+  unsigned long now = millis();
+  if (now - lastTrig < MIN_TRIGGER_GAP_MS) delay(MIN_TRIGGER_GAP_MS - (now - lastTrig));
+  lastTrig = millis();
+
+  // precondition line first
+  preconditionCommonTrigger();
+
+  // emit beep_count beeps (each a BEEP_PULSE_US HIGH)
+  for (int b = 0; b < BEEP_COUNT; ++b) {
+    digitalWrite(COMMON_TRIG_PIN, LOW);
+    delayMicroseconds(2);
+    digitalWrite(COMMON_TRIG_PIN, HIGH);
+    delayMicroseconds(BEEP_PULSE_US);
+    digitalWrite(COMMON_TRIG_PIN, LOW);
+
+    // if not last beep, wait BEEP_GAP_MS to allow line to settle slightly
+    if (b < BEEP_COUNT - 1) delay(BEEP_GAP_MS);
+  }
+
+  // after beeps, wait a short micro delay before listening
+  delayMicroseconds(200);
+
+  // listen for echo (digital)
+  unsigned long pulse_us = readPulseMicrosWithTimeout(echoPin, DIGITAL_ECHO_TIMEOUT_US);
+  if (pulse_us == 0) return -1.0f;
+  return (float)pulse_us / 58.0f; // convert us -> cm
+}
+
+float measureDistanceMedianUsingCommonTrigger(uint8_t echoPin) {
+  float results[PINGS_PER_BATCH];
+  int got = 0;
+  for (int i = 0; i < PINGS_PER_BATCH; ++i) {
+    float d = pingUsingCommonTrigger(echoPin);
+    if (d > 0) results[got++] = d;
+    // short gap between pings (keep small so batch completes quickly)
+    delay(40);
+  }
+  if (got == 0) return -1.0f;
+  // sort to get median for small arrays
+  for (int a = 0; a < got - 1; ++a)
+    for (int b = a + 1; b < got; ++b)
+      if (results[b] < results[a]) { float t = results[a]; results[a] = results[b]; results[b] = t; }
+  return results[got / 2];
+}
+
+// Map measured distance -> percentage using tank config (total height and full distance)
+float distToPercentForSlot(float dist_cm, int slotIdx) {
+  float total = tanksConfig[slotIdx].totalHeightCm;
+  float full = tanksConfig[slotIdx].waterFullDistanceCm;
+
+  if (total <= full) {
+    float pct = 100.0f - (dist_cm / total * 100.0f);
+    if (pct < 0) pct = 0; if (pct > 100) pct = 100;
+    return pct;
+  }
+  if (dist_cm <= full) return 100.0f;
+  if (dist_cm >= total) return 0.0f;
+  float usable = total - full;
+  float pct = (total - dist_cm) / usable * 100.0f;
+  if (pct < 0) pct = 0; if (pct > 100) pct = 100;
+  return pct;
+}
+
+// ===== Measurement & send logic =====
+void initSlots() {
+  for (int i = 0; i < NUM_TANKS; ++i) {
+    slotState[i].level = -1.0f;
+    slotState[i].lastSentValue = -1.0f;
+    slotState[i].lastAcceptedMs = 0;
+    slotState[i].lastSentMs = 0;
+  }
+}
+
+// Sequential measurement using common trigger; waits SENSOR_DELAY_MS between sensors
+void measureAllSequentialCommonTrigger() {
+  for (int i = 0; i < NUM_TANKS; ++i) {
+    uint8_t echo = tanksConfig[i].echoPin;
+    float dist = measureDistanceMedianUsingCommonTrigger(echo);
+    if (dist < 0) {
+      Serial.printf("%s: no echo\n", tanksConfig[i].name);
+    } else {
+      float level = distToPercentForSlot(dist, i);
+      if (slotState[i].level < 0) slotState[i].level = level;
+      else slotState[i].level = SMOOTH_ALPHA * level + (1.0f - SMOOTH_ALPHA) * slotState[i].level;
+      slotState[i].lastAcceptedMs = millis();
+      Serial.printf("%s: dist=%.1f cm -> level=%.1f%%\n", tanksConfig[i].name, dist, slotState[i].level);
+    }
+    // LONGER delay between sensors to prevent cross-talk
+    delay(SENSOR_DELAY_MS);
+  }
+}
+
+// decide send if any slot changed beyond threshold or global keepalive expired
+bool shouldSendNow() {
+  unsigned long now = millis();
+
+  // Any slot changed sufficiently?
+  for (int i = 0; i < NUM_TANKS; ++i) {
+    if (slotState[i].level >= 0) {
+      if (slotState[i].lastSentValue < 0) return true; // never sent yet
+      float delta = fabs(slotState[i].level - slotState[i].lastSentValue);
+      if (delta >= SEND_MIN_DELTA_PCT) return true;
+    }
+  }
+
+  // global keepalive
+  if (lastGlobalSendMs == 0 || (now - lastGlobalSendMs) >= GLOBAL_KEEPALIVE_MS) return true;
+  return false;
+}
+
+// mark values as sent (updates per-slot lastSentValue and timestamps + global send time)
+void markSentValues() {
+  unsigned long now = millis();
+  for (int i = 0; i < NUM_TANKS; ++i) {
+    if (slotState[i].level >= 0) {
+      slotState[i].lastSentValue = slotState[i].level;
+      slotState[i].lastSentMs = now;
+    }
+  }
+  lastGlobalSendMs = now;
+}
+
+// Build and transmit the StructMessage as raw binary (receiver expects this)
+void sendStructMessage() {
+  StructMessage msg;
+  for (int i = 0; i < NUM_TANKS; ++i) {
+    memset(msg.tanks[i].name, 0, sizeof(msg.tanks[i].name));
+    strncpy(msg.tanks[i].name, tanksConfig[i].name, sizeof(msg.tanks[i].name) - 1);
+    msg.tanks[i].levelPercent = slotState[i].level;
+  }
+
+  Udp.beginPacket(RECV_IP, RECV_PORT);
+  Udp.write((uint8_t*)&msg, sizeof(msg));
+  Udp.endPacket();
+
+  Serial.print("SENT: ");
+  for (int i = 0; i < NUM_TANKS; ++i) {
+    Serial.printf("%s=%.1f%%  ", msg.tanks[i].name, msg.tanks[i].levelPercent);
+  }
+  Serial.println();
+}
+
+// ===== Setup / Loop =====
+void setup() {
+  Serial.begin(115200);
+  delay(100);
+
+  // configure common TRIG pin and echo pins
+  pinMode(COMMON_TRIG_PIN, OUTPUT);
+  digitalWrite(COMMON_TRIG_PIN, LOW);
+  for (int i = 0; i < NUM_TANKS; ++i) {
+    pinMode(tanksConfig[i].echoPin, INPUT);
+  }
+
+  initSlots();
+
+  // WiFi connect
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  Serial.printf("Connecting to WiFi %s ...\n", WIFI_SSID);
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) {
+    delay(200); Serial.print(".");
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nWiFi connected!");
+    Serial.print("IP: "); Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("\nWiFi connect failed (will attempt sends when possible).");
+  }
+  Udp.begin(WiFi.localIP(), 0);
+  lastCycleMs = millis();
+
+  // Print configuration summary
+  Serial.println("Configured tanks (common TRIG, multi-beep):");
+  Serial.printf(" COMMON_TRIG_PIN = %d\n", COMMON_TRIG_PIN);
+  Serial.printf(" SENSOR_DELAY_MS = %lums, BEEP_COUNT=%d, BEEP_PULSE_US=%dus, BEEP_GAP_MS=%lums\n",
+                SENSOR_DELAY_MS, BEEP_COUNT, BEEP_PULSE_US, BEEP_GAP_MS);
+  for (int i = 0; i < NUM_TANKS; ++i) {
+    Serial.printf("  %d: %s total=%.1fcm full=%.1fcm ECHO=%d\n",
+                  i + 1, tanksConfig[i].name, tanksConfig[i].totalHeightCm,
+                  tanksConfig[i].waterFullDistanceCm, tanksConfig[i].echoPin);
+  }
+}
+
+void loop() {
+  unsigned long now = millis();
+  if (now - lastCycleMs >= SAMPLE_INTERVAL_MS) {
+    lastCycleMs = now;
+
+    measureAllSequentialCommonTrigger();
+
+    if (shouldSendNow()) {
+      sendStructMessage();
+      markSentValues();
+    } else {
+      Serial.println("No significant change -> skip send");
+    }
+  }
+  delay(5);
+}
